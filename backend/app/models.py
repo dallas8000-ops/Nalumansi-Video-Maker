@@ -1,0 +1,27 @@
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+SHOWCASE_PROMPT = (
+    "An elegant fashion showcase in a professional showroom. "
+    "The model walks slowly toward the camera, turns slightly to show the outfit, "
+    "with natural fabric movement and refined showroom lighting. No extra accessories."
+)
+
+
+class AudioSettings(BaseModel):
+    music_asset_id: str | None = None
+    music_start_seconds: float = Field(default=0, ge=0)
+    music_volume: float = Field(default=1, ge=0, le=1)
+    original_audio_volume: float = Field(default=1, ge=0, le=1)
+    mute_original_audio: bool = False
+
+
+class GenerationRequest(BaseModel):
+    aspect_ratio: Literal["9:16", "1:1", "16:9"] = "9:16"
+    duration_seconds: int = Field(default=8, ge=4, le=15)
+    outfit_asset_id: str
+    background_asset_id: str
+    prompt: str = SHOWCASE_PROMPT
+    audio: AudioSettings = Field(default_factory=AudioSettings)
