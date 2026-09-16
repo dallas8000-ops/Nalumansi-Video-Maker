@@ -6,6 +6,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 
 from app.models import GenerationRequest
+from app.config import Settings
 
 
 app = FastAPI(title="Nalumansi Video Maker API")
@@ -15,6 +16,7 @@ ALLOWED_KINDS.add("music")
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg"}
 GENERATION_JOBS: dict[str, dict[str, str]] = {}
+settings = Settings()
 
 
 @app.get("/health")
@@ -62,6 +64,7 @@ async def upload_asset(
         "asset_id": asset_id,
         "kind": kind,
         "filename": destination.name,
+        "url": f"{settings.public_base_url.rstrip('/')}/api/assets/{asset_id}",
     }
 
 

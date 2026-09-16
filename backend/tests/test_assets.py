@@ -19,6 +19,7 @@ def test_upload_asset_returns_generated_asset_id():
     assert body["kind"] == "background"
     assert body["asset_id"]
     assert body["filename"].endswith(".png")
+    assert body["url"].startswith("http://127.0.0.1:8000/api/assets/")
 
 
 def test_upload_music_asset_returns_generated_asset_id():
