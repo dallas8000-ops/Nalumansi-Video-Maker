@@ -7,6 +7,7 @@ from fastapi.responses import FileResponse
 
 from app.models import GenerationRequest
 from app.config import Settings
+from app.luma import LumaClient, build_generation_payload
 
 
 app = FastAPI(title="Nalumansi Video Maker API")
@@ -27,8 +28,28 @@ def health() -> dict[str, str]:
 @app.post("/api/generations", status_code=status.HTTP_202_ACCEPTED)
 def queue_generation(request: GenerationRequest) -> dict[str, str]:
     job_id = uuid4().hex
-    GENERATION_JOBS[job_id] = {"status": "queued"}
-    return {"job_id": job_id, "status": "queued"}
+    outfit_ids = request.outfit_asset_ids or ([request.outfit_asset_id] if request.outfit_asset_id else [])
+    if not outfit_ids:
+        raise HTTPException(status_code=422, detail="at least one outfit asset is required")
+
+    payload = build_generation_payload(
+        prompt=request.prompt,
+        outfit_urls=[f"{settings.public_base_url.rstrip('/')}/api/assets/{asset_id}" for asset_id in outfit_ids],
+        background_url=f"{settings.public_base_url.rstrip('/')}/api/assets/{request.background_asset_id}",
+        aspect_ratio=request.aspect_ratio,
+        duration_seconds=request.duration_seconds,
+    )
+    try:
+        provider = LumaClient(settings.luma_api_key, settings.luma_endpoint).create_generation(payload)
+    except Exception as error:
+        GENERATION_JOBS[job_id] = {"status": "failed", "error": str(error)}
+        raise HTTPException(status_code=502, detail="Luma generation request failed") from error
+
+    GENERATION_JOBS[job_id] = {
+        "status": provider["status"],
+        "provider_id": provider["provider_id"],
+    }
+    return {"job_id": job_id, **GENERATION_JOBS[job_id]}
 
 
 @app.get("/api/generations/{job_id}")

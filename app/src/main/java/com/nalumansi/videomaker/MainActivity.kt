@@ -3,6 +3,8 @@ package com.nalumansi.videomaker
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
+import android.provider.DocumentsContract
+import org.json.JSONObject
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -38,10 +40,15 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 
 private enum class AppScreen { HOME, ASSETS, EDITOR, GENERATE, RESULT }
 
@@ -59,6 +66,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
 private fun NalumansiApp() {
+    val context = LocalContext.current
     var screen by rememberSaveable { mutableStateOf(AppScreen.HOME) }
     var selectedFormat by rememberSaveable { mutableStateOf("9:16") }
     var duration by rememberSaveable { mutableFloatStateOf(8f) }
@@ -70,15 +78,29 @@ private fun NalumansiApp() {
         mutableStateOf(listOf("210405", "210421", "210434", "210447", "210456"))
     }
     var bundledMusicSelected by rememberSaveable { mutableStateOf(true) }
+    var importedImages by rememberSaveable { mutableStateOf(emptyList<String>()) }
+    var importedAudio by rememberSaveable { mutableStateOf(emptyList<String>()) }
+    var selectedImportedImages by rememberSaveable { mutableStateOf(emptyList<String>()) }
     var musicStart by rememberSaveable { mutableFloatStateOf(0f) }
     var musicVolume by rememberSaveable { mutableFloatStateOf(1f) }
     var originalVolume by rememberSaveable { mutableFloatStateOf(1f) }
     var muteOriginal by rememberSaveable { mutableStateOf(false) }
     var generationQueued by rememberSaveable { mutableStateOf(false) }
+    var generationError by rememberSaveable { mutableStateOf<String?>(null) }
 
     val outfitPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { outfitUri = it }
     val backgroundPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { backgroundUri = it }
     val musicPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { musicUri = it }
+    val scope = rememberCoroutineScope()
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
+        if (treeUri != null) {
+            scope.launch {
+                val imported = withContext(Dispatchers.IO) { importFolder(context, treeUri) }
+                importedImages = imported.filter { it.endsWith(".png", true) || it.endsWith(".jpg", true) || it.endsWith(".jpeg", true) }
+                importedAudio = imported.filter { it.endsWith(".m4a", true) || it.endsWith(".mp3", true) || it.endsWith(".wav", true) }
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -111,6 +133,17 @@ private fun NalumansiApp() {
                 },
                 onSelectBackground = { selectedBackground = it },
                 onSelectBundledMusic = { bundledMusicSelected = it },
+                importedImages = importedImages,
+                importedAudio = importedAudio,
+                selectedImportedImages = selectedImportedImages,
+                onToggleImportedImage = { name ->
+                    selectedImportedImages = if (name in selectedImportedImages) {
+                        selectedImportedImages - name
+                    } else {
+                        selectedImportedImages + name
+                    }
+                },
+                onImportFolder = { folderPicker.launch(null) },
                 onContinue = { screen = AppScreen.EDITOR },
             )
             AppScreen.EDITOR -> EditorScreen(
@@ -129,9 +162,29 @@ private fun NalumansiApp() {
                 onMuteOriginalChange = { muteOriginal = it },
                 onContinue = { screen = AppScreen.GENERATE },
             )
-            AppScreen.GENERATE -> GenerateScreen(Modifier.padding(padding), generationQueued) {
-                generationQueued = true
-                screen = AppScreen.RESULT
+            AppScreen.GENERATE -> GenerateScreen(Modifier.padding(padding), generationError, generationQueued) {
+                scope.launch {
+                    generationQueued = true
+                    generationError = null
+                    try {
+                        val client = ApiClient(context)
+                        val outfitIds = withContext(Dispatchers.IO) {
+                            selectedOutfits.map { label ->
+                                JSONObject(client.uploadBundledAsset("Screenshot 2026-09-16 $label.png", "outfit"))
+                                    .getString("asset_id")
+                            }
+                        }
+                        val backgroundId = withContext(Dispatchers.IO) {
+                            JSONObject(client.uploadBundledAsset("Screenshot 2026-09-16 210354.png", "background"))
+                                .getString("asset_id")
+                        }
+                        withContext(Dispatchers.IO) { client.queueGeneration(outfitIds, backgroundId) }
+                        screen = AppScreen.RESULT
+                    } catch (error: Exception) {
+                        generationError = error.message ?: "Generation request failed"
+                        generationQueued = false
+                    }
+                }
             }
             AppScreen.RESULT -> ResultScreen(Modifier.padding(padding), generationQueued) {
                 generationQueued = false
@@ -165,6 +218,11 @@ private fun AssetsScreen(
     onToggleOutfit: (String) -> Unit,
     onSelectBackground: (String) -> Unit,
     onSelectBundledMusic: (Boolean) -> Unit,
+    importedImages: List<String>,
+    importedAudio: List<String>,
+    selectedImportedImages: List<String>,
+    onToggleImportedImage: (String) -> Unit,
+    onImportFolder: () -> Unit,
     onContinue: () -> Unit,
 ) {
     Column(
@@ -173,6 +231,20 @@ private fun AssetsScreen(
     ) {
         Text("1. Choose your assets", style = MaterialTheme.typography.headlineSmall)
         Text("Five outfit references, the 210354 background, and your M4A track are included.")
+        OutlinedButton(onClick = onImportFolder) { Text("Import from designated folder") }
+        if (importedImages.isNotEmpty() || importedAudio.isNotEmpty()) {
+            Text("Imported library", style = MaterialTheme.typography.titleMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                importedImages.forEach { name ->
+                    ImportedImagePreview(
+                        name = name,
+                        selected = name in selectedImportedImages,
+                        onClick = { onToggleImportedImage(name) },
+                    )
+                }
+            }
+            importedAudio.forEach { name -> Text("Audio: $name") }
+        }
         Text("Background", style = MaterialTheme.typography.titleMedium)
         SampleAssetPreview(
             label = "210354",
@@ -262,14 +334,13 @@ private fun EditorScreen(
 }
 
 @Composable
-private fun GenerateScreen(modifier: Modifier, queued: Boolean, onGenerate: () -> Unit) {
+private fun GenerateScreen(modifier: Modifier, error: String?, queued: Boolean, onGenerate: () -> Unit) {
     Column(modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         Text("3. Generate", style = MaterialTheme.typography.headlineSmall)
         Text("Your five outfits will be combined with the 210354 showroom background and edited audio.")
-        Text(if (queued) "Generation queued" else "Ready to generate", style = MaterialTheme.typography.titleMedium)
-        Button(onClick = onGenerate, enabled = !queued, modifier = Modifier.fillMaxWidth()) {
-            Text(if (queued) "Queued" else "Generate video")
-        }
+        Text(if (queued) "Uploading assets and requesting video..." else "Ready to submit five outfits and the background.", style = MaterialTheme.typography.titleMedium)
+        if (error != null) Text(error, color = MaterialTheme.colorScheme.error)
+        Button(onClick = onGenerate, enabled = !queued, modifier = Modifier.fillMaxWidth()) { Text(if (queued) "Working..." else "Generate video") }
     }
 }
 
@@ -322,5 +393,49 @@ private fun SampleAssetPreview(label: String, selected: Boolean = false, onClick
             }
         }
         Text(if (selected) "$label selected" else label, style = MaterialTheme.typography.labelSmall)
+    }
+}
+
+private fun importFolder(context: android.content.Context, treeUri: Uri): List<String> {
+    val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+        treeUri,
+        DocumentsContract.getTreeDocumentId(treeUri),
+    )
+    val importedDirectory = File(context.filesDir, "media-library").apply { mkdirs() }
+    val imported = mutableListOf<String>()
+    context.contentResolver.query(
+        childrenUri,
+        arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME, DocumentsContract.Document.COLUMN_MIME_TYPE),
+        null,
+        null,
+        null,
+    )?.use { cursor ->
+        val idIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+        val nameIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+        val mimeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+        while (cursor.moveToNext()) {
+            val name = cursor.getString(nameIndex)
+            val mime = cursor.getString(mimeIndex)
+            val supported = mime.startsWith("image/") || mime.startsWith("audio/")
+            if (!supported) continue
+            val documentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, cursor.getString(idIndex))
+            context.contentResolver.openInputStream(documentUri)?.use { input ->
+                File(importedDirectory, name).outputStream().use { output -> input.copyTo(output) }
+            }
+            imported += name
+        }
+    }
+    return imported
+}
+
+@Composable
+private fun ImportedImagePreview(name: String, selected: Boolean, onClick: () -> Unit) {
+    val file = File(LocalContext.current.filesDir, "media-library/$name")
+    val bitmap = remember(name) { BitmapFactory.decodeFile(file.absolutePath) }
+    Column(modifier = Modifier.size(100.dp).clickable(onClick = onClick)) {
+        if (bitmap != null) {
+            Image(bitmap = bitmap.asImageBitmap(), contentDescription = name, modifier = Modifier.size(76.dp))
+        }
+        Text(if (selected) "$name selected" else name, style = MaterialTheme.typography.labelSmall)
     }
 }
