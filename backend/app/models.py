@@ -20,7 +20,7 @@ class AudioSettings(BaseModel):
 
 class GenerationRequest(BaseModel):
     aspect_ratio: Literal["9:16", "1:1", "16:9"] = "9:16"
-    duration_seconds: Literal[5, 9] = 9
+    duration_seconds: Literal[5, 10] = 10  # ray-3.2's valid per-generation durations; ray-2's "9" no longer applies
     outfit_asset_id: str | None = None
     outfit_asset_ids: list[str] = Field(default_factory=list)
     background_asset_id: str
