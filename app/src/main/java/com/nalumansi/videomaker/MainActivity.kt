@@ -86,7 +86,7 @@ private fun NalumansiApp() {
     var selectedFormat by rememberSaveable { mutableStateOf("9:16") }
     // ray-3.2 only accepts 5s or 10s generations — any other value is a 422 from the backend.
     // This is the length of EACH chained shot, not the total video (total ≈ duration × outfit count).
-    var duration by rememberSaveable { mutableIntStateOf(10) }
+    var duration by rememberSaveable { mutableIntStateOf(5) }
     var outfitUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var backgroundUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var musicUri by rememberSaveable { mutableStateOf<Uri?>(null) }
@@ -461,7 +461,7 @@ private fun EditorScreen(
         }
         Text("Shot duration", style = MaterialTheme.typography.titleMedium)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf(5, 10).forEach {
+            listOf(5).forEach {
                 FilterChip(selected = duration == it, onClick = { onDurationChange(it) }, label = { Text("${it}s") })
             }
         }
