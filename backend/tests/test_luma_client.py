@@ -16,12 +16,31 @@ def test_generation_payload_nests_video_fields_and_uses_ray_3_2():
     assert payload["type"] == "video"
     assert payload["aspect_ratio"] == "9:16"
     assert payload["prompt"] == "showcase the outfit"
+    # start_frame/end_frame are rejected with duration 10s; keyframes are the 10s path.
     assert payload["video"] == {
         "resolution": "720p",
         "duration": "10s",
-        "start_frame": {"url": "https://example.test/background"},
-        "end_frame": {"url": "https://example.test/outfit-1"},
+        "keyframes": [
+            {"url": "https://example.test/background"},
+            {"url": "https://example.test/outfit-1"},
+        ],
+        "keyframe_indexes": [0, 240],
     }
+
+
+def test_generation_payload_pins_5s_image_pair_on_the_24fps_grid():
+    payload = build_generation_payload(
+        prompt="showcase the outfit",
+        frame0=("image", "https://example.test/background"),
+        frame1=("image", "https://example.test/outfit-1"),
+        aspect_ratio="9:16",
+        duration_seconds=5,
+    )
+
+    assert payload["video"]["duration"] == "5s"
+    assert payload["video"]["keyframe_indexes"] == [0, 120]
+    assert "start_frame" not in payload["video"]
+    assert "end_frame" not in payload["video"]
 
 
 def test_generation_payload_supports_chaining_from_a_prior_generation():
@@ -30,11 +49,15 @@ def test_generation_payload_supports_chaining_from_a_prior_generation():
         frame0=("generation", "gen-1"),
         frame1=("image", "https://example.test/outfit-2"),
         aspect_ratio="9:16",
-        duration_seconds=5,
+        duration_seconds=10,
     )
 
-    assert payload["video"]["start_frame"] == {"generation_id": "gen-1"}
-    assert payload["video"]["duration"] == "5s"
+    # Extend only accepts a single generation_id start_frame, and not with 10s.
+    assert payload["video"] == {
+        "resolution": "720p",
+        "duration": "5s",
+        "start_frame": {"generation_id": "gen-1"},
+    }
 
 
 def test_luma_client_posts_to_agents_generations_endpoint_and_reads_state():
@@ -106,6 +129,26 @@ def test_luma_client_get_generation_reads_completed_video_url_from_output_list()
 
     assert result["status"] == "completed"
     assert result["video_url"] == "https://cdn.test/presigned-clip.mp4"
+
+
+def test_luma_client_includes_luma_error_body_on_http_failure():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"detail": "duration 10s is not supported with start_frame or end_frame"},
+        )
+
+    client = LumaClient(
+        api_key="test-key",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    try:
+        client.create_generation({"model": "ray-3.2", "type": "video", "prompt": "test"})
+        assert False, "expected ValueError"
+    except ValueError as error:
+        assert "400" in str(error)
+        assert "duration 10s" in str(error)
 
 
 def test_luma_client_raises_when_response_has_no_id():

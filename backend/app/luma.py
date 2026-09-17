@@ -1,17 +1,9 @@
 from typing import Any, Literal
 
 import httpx
-from lumaai import LumaAI
 
 # A keyframe is either a fresh image ("image", url) or a continuation of a
 # previously *completed* generation ("generation", generation_id) — Luma's
-# "extend" mechanic. See build_generation_payload().
-KeyframeSource = tuple[Literal["image", "generation"], str]
-
-TERMINAL_STATES = {"completed", "failed"}
-
-# A keyframe is either a fresh image ("image", url) or a continuation of a
-# previously *completed* generation ("generation", generation_id) — ray-3.2's
 # "extend" mechanic. See build_generation_payload().
 KeyframeSource = tuple[Literal["image", "generation"], str]
 
@@ -34,7 +26,7 @@ class LumaClient:
 
     def create_generation(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = self._client.post(f"{BASE_URL}/generations", json=payload, headers=self._headers)
-        response.raise_for_status()
+        _raise_for_luma_status(response)
         body = response.json()
         if not body.get("id"):
             raise ValueError("Luma response did not include a generation id")
@@ -42,8 +34,15 @@ class LumaClient:
 
     def get_generation(self, generation_id: str) -> dict[str, Any]:
         response = self._client.get(f"{BASE_URL}/generations/{generation_id}", headers=self._headers)
-        response.raise_for_status()
+        _raise_for_luma_status(response)
         return _serialize(response.json())
+
+
+def _raise_for_luma_status(response: httpx.Response) -> None:
+    if response.is_success:
+        return
+    detail = response.text.strip() or response.reason_phrase
+    raise ValueError(f"Luma {response.status_code}: {detail}")
 
 
 def _serialize(body: dict[str, Any]) -> dict[str, Any]:
@@ -74,25 +73,35 @@ def build_generation_payload(
     duration_seconds: int,
     resolution: str = "720p",
 ) -> dict[str, Any]:
-    """ray-3.2 nests its video-specific fields under `video` and calls its two
-    keyframe slots start_frame/end_frame. frame0 -> start_frame, frame1 ->
-    end_frame. start_frame is either a plain reference image or, per Luma's
-    "extend" mechanic, {"generation_id": <a COMPLETED prior generation's id>}
-    to forward-continue from that clip's ending — this is how multiple outfit
-    images become one continuous multi-shot video instead of a single call
-    with N images (ray-3.2 also supports up to 64 keyframes in one call via
-    video.keyframes/keyframe_indexes, but that caps total duration at 10s,
-    which doesn't fit "each outfit gets its own several-second shot" — hence
-    chaining single-keyframe-pair calls instead, same as the ray-2 design)."""
+    """Build a ray-3.2 Agents API video request.
+
+    Image-to-image shots use `video.keyframes` / `keyframe_indexes` (24fps grid:
+    5s → 0–120, 10s → 0–240). The legacy `start_frame`/`end_frame` pair is
+    rejected with `duration: "10s"`, which is the app's default shot length.
+
+    Forward-extend from a completed clip can only send a single
+    `start_frame.generation_id`. Luma does not yet interpolate a prior
+    generation plus another image, and `start_frame` cannot be combined with
+    10s, so extend steps are always 5s.
+    """
+    if frame0[0] == "generation":
+        video: dict[str, Any] = {
+            "resolution": resolution,
+            "duration": "5s",
+            "start_frame": {"generation_id": frame0[1]},
+        }
+    else:
+        last_index = duration_seconds * 24
+        video = {
+            "resolution": resolution,
+            "duration": f"{duration_seconds}s",
+            "keyframes": [_keyframe(frame0), _keyframe(frame1)],
+            "keyframe_indexes": [0, last_index],
+        }
     return {
         "model": "ray-3.2",
         "type": "video",
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,
-        "video": {
-            "resolution": resolution,
-            "duration": f"{duration_seconds}s",
-            "start_frame": _keyframe(frame0),
-            "end_frame": _keyframe(frame1),
-        },
+        "video": video,
     }
