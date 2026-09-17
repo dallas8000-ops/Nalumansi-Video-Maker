@@ -7,7 +7,7 @@ from app.models import AudioSettings, GenerationRequest
 def test_generation_request_contains_showcase_prompt_and_audio_settings():
     request = GenerationRequest(
         aspect_ratio="9:16",
-        duration_seconds=8,
+        duration_seconds=9,
         outfit_asset_id="outfit-1",
         background_asset_id="background-1",
         audio=AudioSettings(

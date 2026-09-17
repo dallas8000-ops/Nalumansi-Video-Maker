@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Matches context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) in
+         MainActivity/ApiClient, where finished videos are downloaded to. -->
+    <external-files-path name="movies" path="Movies/" />
+</paths>
