@@ -104,16 +104,11 @@ def run_generation_chain(
     duration_seconds: int,
     client: LumaClient | None = None,
 ) -> None:
-    """Luma's video model takes exactly two keyframe images per call, so N
-    outfit photos become N chained calls: step 1 goes background -> outfit[0],
-    then each following step continues from the *previous completed*
-    generation (Luma's "extend" mechanic — keyframes.frame0 =
-    {"type": "generation", "id": ...}) toward the next outfit. Each step must
-    reach a terminal state before the next can start, since Luma needs a
-    completed generation id to continue from. The segments are then
-    downloaded and concatenated into one deliverable file, with the uploaded
-    music track (if any) muxed in — Luma's clips carry no audio track of
-    their own."""
+    """N outfit photos become N chained Luma calls. The first shot is
+    image-to-video from the outfit photo only (not background → outfit), so
+    Luma does not morph an empty room into a person. Later shots extend from
+    the previous completed generation. Segments are downloaded and concatenated,
+    with uploaded music muxed in — Luma clips have no audio of their own."""
     client = client or LumaClient(settings.luma_api_key)
     frame0 = ("image", background_url)
     segment_paths: list[Path] = []

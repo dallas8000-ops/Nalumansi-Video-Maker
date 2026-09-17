@@ -75,14 +75,15 @@ def build_generation_payload(
 ) -> dict[str, Any]:
     """Build a ray-3.2 Agents API video request.
 
-    Image-to-image shots use `video.keyframes` / `keyframe_indexes` (24fps grid:
-    5s → 0–120, 10s → 0–240). The legacy `start_frame`/`end_frame` pair is
-    rejected with `duration: "10s"`, which is the app's default shot length.
+    Image-to-video pins only the outfit as the first frame. Pairing an empty
+    showroom as start and the outfit photo as end makes Luma morph one picture
+    into the other, which changes the background and produces ugly motion.
+
+    5s uses start_frame. 10s cannot use start_frame, so it uses a single
+    keyframe at index 0.
 
     Forward-extend from a completed clip can only send a single
-    `start_frame.generation_id`. Luma does not yet interpolate a prior
-    generation plus another image, and `start_frame` cannot be combined with
-    10s, so extend steps are always 5s.
+    `start_frame.generation_id`, and not with 10s, so extend steps are 5s.
     """
     if frame0[0] == "generation":
         video: dict[str, Any] = {
@@ -90,13 +91,18 @@ def build_generation_payload(
             "duration": "5s",
             "start_frame": {"generation_id": frame0[1]},
         }
+    elif duration_seconds == 10:
+        video = {
+            "resolution": resolution,
+            "duration": "10s",
+            "keyframes": [_keyframe(frame1)],
+            "keyframe_indexes": [0],
+        }
     else:
-        last_index = duration_seconds * 24
         video = {
             "resolution": resolution,
             "duration": f"{duration_seconds}s",
-            "keyframes": [_keyframe(frame0), _keyframe(frame1)],
-            "keyframe_indexes": [0, last_index],
+            "start_frame": _keyframe(frame1),
         }
     return {
         "model": "ray-3.2",

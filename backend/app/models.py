@@ -4,9 +4,11 @@ from pydantic import BaseModel, Field
 
 
 SHOWCASE_PROMPT = (
-    "An elegant fashion showcase in a professional showroom. "
-    "The model walks slowly toward the camera, turns slightly to show the outfit, "
-    "with natural fabric movement and refined showroom lighting. No extra accessories."
+    "Photoreal fashion video of this exact model, this exact outfit, and this exact location. "
+    "Locked camera. Keep the same background, walls, floor, furniture, and lighting for the whole clip. "
+    "The model takes a slow small step toward the camera and a slight turn to show the garment, "
+    "with natural fabric movement only. Do not morph the room, replace the background, "
+    "change clothes, add accessories, or jump-cut to another place."
 )
 
 

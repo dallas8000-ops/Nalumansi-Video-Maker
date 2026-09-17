@@ -16,19 +16,17 @@ def test_generation_payload_nests_video_fields_and_uses_ray_3_2():
     assert payload["type"] == "video"
     assert payload["aspect_ratio"] == "9:16"
     assert payload["prompt"] == "showcase the outfit"
-    # start_frame/end_frame are rejected with duration 10s; keyframes are the 10s path.
+    # Pin only the outfit. Using background as start and outfit as end morphs
+    # the empty room into the person, which changes the background mid-clip.
     assert payload["video"] == {
         "resolution": "720p",
         "duration": "10s",
-        "keyframes": [
-            {"url": "https://example.test/background"},
-            {"url": "https://example.test/outfit-1"},
-        ],
-        "keyframe_indexes": [0, 240],
+        "keyframes": [{"url": "https://example.test/outfit-1"}],
+        "keyframe_indexes": [0],
     }
 
 
-def test_generation_payload_pins_5s_image_pair_on_the_24fps_grid():
+def test_generation_payload_pins_5s_shot_to_the_outfit_start_frame_only():
     payload = build_generation_payload(
         prompt="showcase the outfit",
         frame0=("image", "https://example.test/background"),
@@ -37,10 +35,11 @@ def test_generation_payload_pins_5s_image_pair_on_the_24fps_grid():
         duration_seconds=5,
     )
 
-    assert payload["video"]["duration"] == "5s"
-    assert payload["video"]["keyframe_indexes"] == [0, 120]
-    assert "start_frame" not in payload["video"]
-    assert "end_frame" not in payload["video"]
+    assert payload["video"] == {
+        "resolution": "720p",
+        "duration": "5s",
+        "start_frame": {"url": "https://example.test/outfit-1"},
+    }
 
 
 def test_generation_payload_supports_chaining_from_a_prior_generation():

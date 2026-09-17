@@ -19,7 +19,7 @@ def test_generation_request_contains_showcase_prompt_and_audio_settings():
         ),
     )
 
-    assert "walks slowly toward the camera" in request.prompt
+    assert "Locked camera" in request.prompt
     assert request.audio.music_start_seconds == 2
     assert request.audio.music_volume == 0.7
 
