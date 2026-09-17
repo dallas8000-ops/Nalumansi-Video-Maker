@@ -1,8 +1,10 @@
 package com.nalumansi.videomaker
 
+import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.provider.DocumentsContract
 import org.json.JSONObject
 import androidx.activity.ComponentActivity
@@ -10,6 +12,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -20,22 +23,28 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -45,12 +54,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
-private enum class AppScreen { HOME, ASSETS, EDITOR, GENERATE, RESULT }
+private enum class AppScreen { HOME, ASSETS, EDITOR, GENERATE, PROCESSING, RESULT }
+
+private const val BUNDLED_BACKGROUND = "210354"
+private val BUNDLED_OUTFITS = listOf("210405", "210421", "210434", "210447", "210456")
+private const val BUNDLED_MUSIC_FILENAME = "Recording (35).m4a"
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -69,14 +84,14 @@ private fun NalumansiApp() {
     val context = LocalContext.current
     var screen by rememberSaveable { mutableStateOf(AppScreen.HOME) }
     var selectedFormat by rememberSaveable { mutableStateOf("9:16") }
-    var duration by rememberSaveable { mutableFloatStateOf(8f) }
+    // Luma's video model only accepts 5s or 9s generations — any other value is a 422 from the backend.
+    // This is the length of EACH chained shot, not the total video (total ≈ duration × outfit count).
+    var duration by rememberSaveable { mutableIntStateOf(9) }
     var outfitUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var backgroundUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var musicUri by rememberSaveable { mutableStateOf<Uri?>(null) }
-    var selectedBackground by rememberSaveable { mutableStateOf("210354") }
-    var selectedOutfits by rememberSaveable {
-        mutableStateOf(listOf("210405", "210421", "210434", "210447", "210456"))
-    }
+    var selectedBackground by rememberSaveable { mutableStateOf(BUNDLED_BACKGROUND) }
+    var selectedOutfits by rememberSaveable { mutableStateOf(BUNDLED_OUTFITS) }
     var bundledMusicSelected by rememberSaveable { mutableStateOf(true) }
     var importedImages by rememberSaveable { mutableStateOf(emptyList<String>()) }
     var importedAudio by rememberSaveable { mutableStateOf(emptyList<String>()) }
@@ -85,12 +100,19 @@ private fun NalumansiApp() {
     var musicVolume by rememberSaveable { mutableFloatStateOf(1f) }
     var originalVolume by rememberSaveable { mutableFloatStateOf(1f) }
     var muteOriginal by rememberSaveable { mutableStateOf(false) }
-    var generationQueued by rememberSaveable { mutableStateOf(false) }
-    var generationError by rememberSaveable { mutableStateOf<String?>(null) }
 
-    val outfitPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { outfitUri = it }
-    val backgroundPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { backgroundUri = it }
-    val musicPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { musicUri = it }
+    // In-flight / finished job state. jobId surviving a rotation lets PROCESSING
+    // pick the poll back up instead of losing track of a job already running server-side.
+    var jobId by rememberSaveable { mutableStateOf<String?>(null) }
+    var jobStep by rememberSaveable { mutableIntStateOf(0) }
+    var jobTotalSteps by rememberSaveable { mutableIntStateOf(0) }
+    var jobBusy by rememberSaveable { mutableStateOf(false) }
+    var jobError by rememberSaveable { mutableStateOf<String?>(null) }
+    var resultVideoPath by rememberSaveable { mutableStateOf<String?>(null) }
+
+    val outfitPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { if (it != null) outfitUri = it }
+    val backgroundPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { if (it != null) backgroundUri = it }
+    val musicPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { if (it != null) musicUri = it }
     val scope = rememberCoroutineScope()
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
         if (treeUri != null) {
@@ -102,12 +124,27 @@ private fun NalumansiApp() {
         }
     }
 
+    fun resetJobState() {
+        jobId = null
+        jobStep = 0
+        jobTotalSteps = 0
+        jobBusy = false
+        jobError = null
+        resultVideoPath = null
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Nalumansi Video Maker") },
                 navigationIcon = {
-                    if (screen != AppScreen.HOME) {
+                    if (screen == AppScreen.ASSETS) {
+                        OutlinedButton(onClick = { screen = AppScreen.HOME }) { Text("Home") }
+                    } else if (screen == AppScreen.EDITOR) {
+                        OutlinedButton(onClick = { screen = AppScreen.ASSETS }) { Text("Back") }
+                    } else if (screen == AppScreen.GENERATE) {
+                        OutlinedButton(onClick = { screen = AppScreen.EDITOR }) { Text("Back") }
+                    } else if (screen == AppScreen.RESULT) {
                         OutlinedButton(onClick = { screen = AppScreen.HOME }) { Text("Home") }
                     }
                 },
@@ -115,21 +152,25 @@ private fun NalumansiApp() {
         },
     ) { padding ->
         when (screen) {
-            AppScreen.HOME -> HomeScreen(Modifier.padding(padding)) { screen = AppScreen.ASSETS }
+            AppScreen.HOME -> HomeScreen(Modifier.padding(padding), outfitCount = selectedOutfits.size) {
+                screen = AppScreen.ASSETS
+            }
             AppScreen.ASSETS -> AssetsScreen(
                 modifier = Modifier.padding(padding),
                 selectedOutfits = selectedOutfits,
                 selectedBackground = selectedBackground,
                 bundledMusicSelected = bundledMusicSelected,
+                customOutfitName = outfitUri?.let { displayNameOf(context, it) },
+                customBackgroundName = backgroundUri?.let { displayNameOf(context, it) },
+                customMusicName = musicUri?.let { displayNameOf(context, it) },
                 onChooseOutfit = { outfitPicker.launch(arrayOf("image/*")) },
                 onChooseBackground = { backgroundPicker.launch(arrayOf("image/*")) },
                 onChooseMusic = { musicPicker.launch(arrayOf("audio/*")) },
+                onClearOutfit = { outfitUri = null },
+                onClearBackground = { backgroundUri = null },
+                onClearMusic = { musicUri = null },
                 onToggleOutfit = { label ->
-                    selectedOutfits = if (label in selectedOutfits) {
-                        selectedOutfits - label
-                    } else {
-                        selectedOutfits + label
-                    }
+                    selectedOutfits = if (label in selectedOutfits) selectedOutfits - label else selectedOutfits + label
                 },
                 onSelectBackground = { selectedBackground = it },
                 onSelectBundledMusic = { bundledMusicSelected = it },
@@ -137,11 +178,7 @@ private fun NalumansiApp() {
                 importedAudio = importedAudio,
                 selectedImportedImages = selectedImportedImages,
                 onToggleImportedImage = { name ->
-                    selectedImportedImages = if (name in selectedImportedImages) {
-                        selectedImportedImages - name
-                    } else {
-                        selectedImportedImages + name
-                    }
+                    selectedImportedImages = if (name in selectedImportedImages) selectedImportedImages - name else selectedImportedImages + name
                 },
                 onImportFolder = { folderPicker.launch(null) },
                 onContinue = { screen = AppScreen.EDITOR },
@@ -152,6 +189,7 @@ private fun NalumansiApp() {
                 onFormatChange = { selectedFormat = it },
                 duration = duration,
                 onDurationChange = { duration = it },
+                outfitCount = selectedOutfits.size,
                 musicStart = musicStart,
                 onMusicStartChange = { musicStart = it },
                 musicVolume = musicVolume,
@@ -162,46 +200,139 @@ private fun NalumansiApp() {
                 onMuteOriginalChange = { muteOriginal = it },
                 onContinue = { screen = AppScreen.GENERATE },
             )
-            AppScreen.GENERATE -> GenerateScreen(Modifier.padding(padding), generationError, generationQueued) {
+            AppScreen.GENERATE -> GenerateScreen(
+                modifier = Modifier.padding(padding),
+                outfitCount = selectedOutfits.size,
+                durationSeconds = duration,
+                error = jobError,
+                busy = jobBusy,
+            ) {
                 scope.launch {
-                    generationQueued = true
-                    generationError = null
+                    jobBusy = true
+                    jobError = null
                     try {
                         val client = ApiClient(context)
                         val outfitIds = withContext(Dispatchers.IO) {
-                            selectedOutfits.map { label ->
-                                JSONObject(client.uploadBundledAsset("Screenshot 2026-09-16 $label.png", "outfit"))
-                                    .getString("asset_id")
+                            val customOutfit = outfitUri
+                            if (customOutfit != null) {
+                                listOf(JSONObject(client.uploadUriAsset(customOutfit, "outfit")).getString("asset_id"))
+                            } else {
+                                selectedOutfits.map { label ->
+                                    JSONObject(client.uploadBundledAsset("Screenshot 2026-09-16 $label.png", "outfit")).getString("asset_id")
+                                }
                             }
                         }
                         val backgroundId = withContext(Dispatchers.IO) {
-                            JSONObject(client.uploadBundledAsset("Screenshot 2026-09-16 210354.png", "background"))
-                                .getString("asset_id")
+                            val customBackground = backgroundUri
+                            if (customBackground != null) {
+                                JSONObject(client.uploadUriAsset(customBackground, "background")).getString("asset_id")
+                            } else {
+                                JSONObject(client.uploadBundledAsset("Screenshot 2026-09-16 $BUNDLED_BACKGROUND.png", "background")).getString("asset_id")
+                            }
                         }
-                        withContext(Dispatchers.IO) { client.queueGeneration(outfitIds, backgroundId) }
-                        screen = AppScreen.RESULT
+                        val musicId = withContext(Dispatchers.IO) {
+                            val customMusic = musicUri
+                            when {
+                                customMusic != null -> JSONObject(client.uploadUriAsset(customMusic, "music")).getString("asset_id")
+                                bundledMusicSelected -> JSONObject(client.uploadBundledAsset(BUNDLED_MUSIC_FILENAME, "music")).getString("asset_id")
+                                else -> null
+                            }
+                        }
+                        val response = withContext(Dispatchers.IO) {
+                            JSONObject(
+                                client.queueGeneration(
+                                    outfitAssetIds = outfitIds,
+                                    backgroundAssetId = backgroundId,
+                                    durationSeconds = duration,
+                                    musicAssetId = musicId,
+                                    musicStartSeconds = musicStart,
+                                    musicVolume = musicVolume,
+                                    originalVolume = originalVolume,
+                                    muteOriginal = muteOriginal,
+                                )
+                            )
+                        }
+                        jobId = response.getString("job_id")
+                        jobTotalSteps = response.optInt("total_steps", outfitIds.size)
+                        jobStep = response.optInt("step", 0)
+                        jobBusy = false
+                        screen = AppScreen.PROCESSING
                     } catch (error: Exception) {
-                        generationError = error.message ?: "Generation request failed"
-                        generationQueued = false
+                        jobError = error.message ?: "Generation request failed"
+                        jobBusy = false
                     }
                 }
             }
-            AppScreen.RESULT -> ResultScreen(Modifier.padding(padding), generationQueued) {
-                generationQueued = false
-                screen = AppScreen.ASSETS
+            AppScreen.PROCESSING -> {
+                val currentJobId = jobId
+                if (currentJobId != null) {
+                    LaunchedEffect(currentJobId) {
+                        val client = ApiClient(context)
+                        while (true) {
+                            try {
+                                val statusBody = withContext(Dispatchers.IO) { JSONObject(client.getGenerationStatus(currentJobId)) }
+                                jobStep = statusBody.optInt("step", jobStep)
+                                jobTotalSteps = statusBody.optInt("total_steps", jobTotalSteps)
+                                when (statusBody.optString("status", "running")) {
+                                    "completed" -> {
+                                        val videoUrl = statusBody.getString("video_url")
+                                        // getExternalFilesDir can return null if external storage is
+                                        // unavailable; fall back to internal storage (still shareable via FileProvider).
+                                        val moviesDir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: context.filesDir
+                                        val destination = File(moviesDir, "nalumansi-$currentJobId.mp4")
+                                        withContext(Dispatchers.IO) { client.downloadVideo(videoUrl, destination) }
+                                        resultVideoPath = destination.absolutePath
+                                        screen = AppScreen.RESULT
+                                        return@LaunchedEffect
+                                    }
+                                    "failed" -> {
+                                        jobError = statusBody.optString("error", "Generation failed")
+                                        screen = AppScreen.GENERATE
+                                        return@LaunchedEffect
+                                    }
+                                    else -> delay(3000)
+                                }
+                            } catch (error: Exception) {
+                                jobError = error.message ?: "Lost connection while checking progress"
+                                screen = AppScreen.GENERATE
+                                return@LaunchedEffect
+                            }
+                        }
+                    }
+                }
+                ProcessingScreen(Modifier.padding(padding), step = jobStep, totalSteps = jobTotalSteps)
             }
+            AppScreen.RESULT -> ResultScreen(
+                modifier = Modifier.padding(padding),
+                videoPath = resultVideoPath,
+                onShare = {
+                    resultVideoPath?.let { path ->
+                        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(path))
+                        val intent = Intent(Intent.ACTION_SEND).apply {
+                            type = "video/mp4"
+                            putExtra(Intent.EXTRA_STREAM, uri)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        context.startActivity(Intent.createChooser(intent, "Share video"))
+                    }
+                },
+                onNewVideo = {
+                    resetJobState()
+                    screen = AppScreen.ASSETS
+                },
+            )
         }
     }
 }
 
 @Composable
-private fun HomeScreen(modifier: Modifier, onStart: () -> Unit) {
+private fun HomeScreen(modifier: Modifier, outfitCount: Int, onStart: () -> Unit) {
     Column(modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         Text("Create polished outfit videos", style = MaterialTheme.typography.headlineMedium)
         Text("Build an Instagram-ready fashion showcase from outfits, a showroom background, and music.")
         HorizontalDivider()
         Text("Current project", style = MaterialTheme.typography.titleMedium)
-        Text("5 outfits  |  1 background  |  1 music track")
+        Text("$outfitCount outfit${if (outfitCount == 1) "" else "s"}  |  1 background  |  1 music track")
         Button(onClick = onStart, modifier = Modifier.fillMaxWidth()) { Text("Start a new video") }
     }
 }
@@ -212,9 +343,15 @@ private fun AssetsScreen(
     selectedOutfits: List<String>,
     selectedBackground: String,
     bundledMusicSelected: Boolean,
+    customOutfitName: String?,
+    customBackgroundName: String?,
+    customMusicName: String?,
     onChooseOutfit: () -> Unit,
     onChooseBackground: () -> Unit,
     onChooseMusic: () -> Unit,
+    onClearOutfit: () -> Unit,
+    onClearBackground: () -> Unit,
+    onClearMusic: () -> Unit,
     onToggleOutfit: (String) -> Unit,
     onSelectBackground: (String) -> Unit,
     onSelectBundledMusic: (Boolean) -> Unit,
@@ -230,7 +367,7 @@ private fun AssetsScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         Text("1. Choose your assets", style = MaterialTheme.typography.headlineSmall)
-        Text("Five outfit references, the 210354 background, and your M4A track are included.")
+        Text("${selectedOutfits.size} sample outfit reference(s), a background, and a music track are pre-loaded — swap any of them for your own below.")
         OutlinedButton(onClick = onImportFolder) { Text("Import from designated folder") }
         if (importedImages.isNotEmpty() || importedAudio.isNotEmpty()) {
             Text("Imported library", style = MaterialTheme.typography.titleMedium)
@@ -245,44 +382,51 @@ private fun AssetsScreen(
             }
             importedAudio.forEach { name -> Text("Audio: $name") }
         }
+
         Text("Background", style = MaterialTheme.typography.titleMedium)
-        SampleAssetPreview(
-            label = "210354",
-            selected = selectedBackground == "210354",
-            onClick = { onSelectBackground("210354") },
-        )
-        OutlinedButton(onClick = onChooseBackground) {
-            Text("Replace with device image")
+        if (customBackgroundName != null) {
+            AssetSwapStatus(fileName = customBackgroundName, onClear = onClearBackground)
+        } else {
+            SampleAssetPreview(label = BUNDLED_BACKGROUND, selected = selectedBackground == BUNDLED_BACKGROUND, onClick = { onSelectBackground(BUNDLED_BACKGROUND) })
+            OutlinedButton(onClick = onChooseBackground) { Text("Replace with device image") }
         }
+
         Text("Outfit references", style = MaterialTheme.typography.titleMedium)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("210405", "210421", "210434", "210447", "210456").forEach { label ->
-                SampleAssetPreview(
-                    label = label,
-                    selected = label in selectedOutfits,
-                    onClick = { onToggleOutfit(label) },
-                )
+        if (customOutfitName != null) {
+            Text("Using a single device image replaces the sample set below.", style = MaterialTheme.typography.bodySmall)
+            AssetSwapStatus(fileName = customOutfitName, onClear = onClearOutfit)
+        } else {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                BUNDLED_OUTFITS.forEach { label ->
+                    SampleAssetPreview(label = label, selected = label in selectedOutfits, onClick = { onToggleOutfit(label) })
+                }
             }
+            Text("${selectedOutfits.size} outfit${if (selectedOutfits.size == 1) "" else "s"} selected — each becomes one chained shot in the final video.", style = MaterialTheme.typography.labelLarge)
+            OutlinedButton(onClick = onChooseOutfit) { Text("Replace with a single device image") }
         }
-        OutlinedButton(onClick = onChooseOutfit) {
-            Text("Replace with device images")
-        }
+
         Text("Music", style = MaterialTheme.typography.titleMedium)
-        Text("Recording (35).m4a")
-        FilterChip(
-            selected = bundledMusicSelected,
-            onClick = { onSelectBundledMusic(!bundledMusicSelected) },
-            label = { Text("Use bundled music") },
-        )
-        OutlinedButton(onClick = onChooseMusic) {
-            Text("Replace with device audio")
+        if (customMusicName != null) {
+            AssetSwapStatus(fileName = customMusicName, onClear = onClearMusic)
+        } else {
+            Text(BUNDLED_MUSIC_FILENAME)
+            FilterChip(selected = bundledMusicSelected, onClick = { onSelectBundledMusic(!bundledMusicSelected) }, label = { Text(if (bundledMusicSelected) "Bundled music on" else "No music") })
+            OutlinedButton(onClick = onChooseMusic) { Text("Replace with device audio") }
         }
-        Text("${selectedOutfits.size} outfits selected", style = MaterialTheme.typography.labelLarge)
+
         Button(
             onClick = onContinue,
-            enabled = selectedOutfits.isNotEmpty() && selectedBackground.isNotEmpty(),
+            enabled = (customOutfitName != null || selectedOutfits.isNotEmpty()) && selectedBackground.isNotEmpty(),
             modifier = Modifier.fillMaxWidth(),
         ) { Text("Continue to editor") }
+    }
+}
+
+@Composable
+private fun AssetSwapStatus(fileName: String, onClear: () -> Unit) {
+    Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Using: $fileName", style = MaterialTheme.typography.bodyMedium)
+        TextButton(onClick = onClear) { Text("Use bundled instead") }
     }
 }
 
@@ -291,8 +435,9 @@ private fun EditorScreen(
     modifier: Modifier,
     format: String,
     onFormatChange: (String) -> Unit,
-    duration: Float,
-    onDurationChange: (Float) -> Unit,
+    duration: Int,
+    onDurationChange: (Int) -> Unit,
+    outfitCount: Int,
     musicStart: Float,
     onMusicStartChange: (Float) -> Unit,
     musicVolume: Float,
@@ -314,8 +459,17 @@ private fun EditorScreen(
                 FilterChip(selected = format == it, onClick = { onFormatChange(it) }, label = { Text(it) })
             }
         }
-        Text("Duration: ${duration.toInt()} seconds")
-        Slider(value = duration, onValueChange = onDurationChange, valueRange = 4f..15f, steps = 10)
+        Text("Shot duration", style = MaterialTheme.typography.titleMedium)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(5, 9).forEach {
+                FilterChip(selected = duration == it, onClick = { onDurationChange(it) }, label = { Text("${it}s") })
+            }
+        }
+        Text(
+            "Each outfit becomes its own $duration-second shot, chained onto the last. " +
+                "Total video length ≈ ${duration * outfitCount}s across $outfitCount shot${if (outfitCount == 1) "" else "s"}.",
+            style = MaterialTheme.typography.bodySmall,
+        )
         Text("Movement", style = MaterialTheme.typography.titleMedium)
         Text("Slow walk toward camera, slight turn, natural fabric movement, elegant showroom lighting, no extra accessories.")
         Text("Audio", style = MaterialTheme.typography.titleMedium)
@@ -334,36 +488,67 @@ private fun EditorScreen(
 }
 
 @Composable
-private fun GenerateScreen(modifier: Modifier, error: String?, queued: Boolean, onGenerate: () -> Unit) {
+private fun GenerateScreen(modifier: Modifier, outfitCount: Int, durationSeconds: Int, error: String?, busy: Boolean, onGenerate: () -> Unit) {
     Column(modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         Text("3. Generate", style = MaterialTheme.typography.headlineSmall)
-        Text("Your five outfits will be combined with the 210354 showroom background and edited audio.")
-        Text(if (queued) "Uploading assets and requesting video..." else "Ready to submit five outfits and the background.", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "$outfitCount outfit${if (outfitCount == 1) "" else "s"} will be chained into one continuous " +
+                "~${outfitCount * durationSeconds}s video against the showroom background.",
+        )
+        Text(
+            if (busy) "Uploading your assets..." else "Ready to submit. Generation runs as $outfitCount chained shots and can take several minutes.",
+            style = MaterialTheme.typography.titleMedium,
+        )
         if (error != null) Text(error, color = MaterialTheme.colorScheme.error)
-        Button(onClick = onGenerate, enabled = !queued, modifier = Modifier.fillMaxWidth()) { Text(if (queued) "Working..." else "Generate video") }
+        Button(onClick = onGenerate, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+            if (busy) {
+                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Text("Uploading...")
+                }
+            } else {
+                Text("Generate video")
+            }
+        }
     }
 }
 
 @Composable
-private fun ResultScreen(modifier: Modifier, queued: Boolean, onNewVideo: () -> Unit) {
+private fun ProcessingScreen(modifier: Modifier, step: Int, totalSteps: Int) {
     Column(modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
-        Text("4. Result", style = MaterialTheme.typography.headlineSmall)
-        Text(if (queued) "Preparing your video" else "No video generated yet.")
-        Surface(tonalElevation = 2.dp, modifier = Modifier.fillMaxWidth().height(220.dp)) {
-            Column(
-                modifier = Modifier.fillMaxSize().padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                SampleAssetPreview("210354", selected = true)
-                Text(
-                    if (queued) {
-                        "Showroom preview loaded. The finished video will replace this image after the backend submits and completes the Luma generation job."
-                    } else {
-                        "Select assets and generate a video to see the result here."
-                    },
-                    style = MaterialTheme.typography.bodyMedium,
-                )
+        Text("Generating your video", style = MaterialTheme.typography.headlineSmall)
+        Text(
+            if (totalSteps > 0 && step > 0) {
+                "Shot $step of $totalSteps — each shot continues from the last, so this takes a few minutes per outfit."
+            } else {
+                "Starting the first shot..."
+            },
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        LinearProgressIndicator(
+            progress = { if (totalSteps > 0) step.toFloat() / totalSteps else 0f },
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text("Keep the app open — this screen updates automatically when each shot finishes.", style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun ResultScreen(modifier: Modifier, videoPath: String?, onShare: () -> Unit, onNewVideo: () -> Unit) {
+    Column(modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+        Text("4. Your video is ready", style = MaterialTheme.typography.headlineSmall)
+        Surface(tonalElevation = 2.dp, modifier = Modifier.fillMaxWidth().height(160.dp)) {
+            Column(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (videoPath != null) {
+                    Text("Saved on this device.", style = MaterialTheme.typography.titleMedium)
+                    Text(videoPath, style = MaterialTheme.typography.bodySmall)
+                } else {
+                    Text("No video generated yet.")
+                }
             }
+        }
+        if (videoPath != null) {
+            Button(onClick = onShare, modifier = Modifier.fillMaxWidth()) { Text("Share video") }
         }
         OutlinedButton(onClick = onNewVideo, modifier = Modifier.fillMaxWidth()) { Text("Create another video") }
     }
@@ -383,7 +568,13 @@ private fun SampleAssetPreview(label: String, selected: Boolean = false, onClick
         if (bitmap != null) {
             Surface(
                 tonalElevation = if (selected) 6.dp else 0.dp,
-                modifier = Modifier.size(64.dp),
+                modifier = Modifier
+                    .size(64.dp)
+                    .border(
+                        width = if (selected) 2.dp else 0.dp,
+                        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
+                        shape = RoundedCornerShape(8.dp),
+                    ),
             ) {
                 Image(
                     bitmap = bitmap.asImageBitmap(),
@@ -392,7 +583,7 @@ private fun SampleAssetPreview(label: String, selected: Boolean = false, onClick
                 )
             }
         }
-        Text(if (selected) "$label selected" else label, style = MaterialTheme.typography.labelSmall)
+        Text(if (selected) "Selected" else "Select", style = MaterialTheme.typography.labelSmall)
     }
 }
 
@@ -426,6 +617,14 @@ private fun importFolder(context: android.content.Context, treeUri: Uri): List<S
         }
     }
     return imported
+}
+
+private fun displayNameOf(context: android.content.Context, uri: Uri): String? {
+    context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+        val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+        if (nameIndex >= 0 && cursor.moveToFirst()) return cursor.getString(nameIndex)
+    }
+    return uri.lastPathSegment
 }
 
 @Composable

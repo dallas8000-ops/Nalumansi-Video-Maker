@@ -20,7 +20,7 @@ class AudioSettings(BaseModel):
 
 class GenerationRequest(BaseModel):
     aspect_ratio: Literal["9:16", "1:1", "16:9"] = "9:16"
-    duration_seconds: int = Field(default=8, ge=4, le=15)
+    duration_seconds: Literal[5, 9] = 9
     outfit_asset_id: str | None = None
     outfit_asset_ids: list[str] = Field(default_factory=list)
     background_asset_id: str
