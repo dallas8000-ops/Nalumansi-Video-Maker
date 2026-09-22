@@ -7,12 +7,13 @@ from uuid import uuid4
 
 import httpx
 import imageio_ffmpeg
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 
 from app.config import Settings
 from app.luma import LumaClient, TERMINAL_STATES, build_generation_payload
 from app.models import AudioSettings, GenerationRequest
+from app.security import require_api_key
 
 app = FastAPI(title="Nalumansi Video Maker API")
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
@@ -45,7 +46,7 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/generations", status_code=status.HTTP_202_ACCEPTED)
+@app.post("/api/generations", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_api_key)])
 def queue_generation(request: GenerationRequest, background_tasks: BackgroundTasks) -> dict[str, object]:
     job_id = uuid4().hex
     outfit_ids = request.outfit_asset_ids or ([request.outfit_asset_id] if request.outfit_asset_id else [])
@@ -104,13 +105,23 @@ def run_generation_chain(
     duration_seconds: int,
     client: LumaClient | None = None,
 ) -> None:
-    """N outfit photos become N chained Luma calls. The first shot is
-    image-to-video from the outfit photo only (not background → outfit), so
-    Luma does not morph an empty room into a person. Later shots extend from
-    the previous completed generation. Segments are downloaded and concatenated,
-    with uploaded music muxed in — Luma clips have no audio of their own."""
+    """N outfit photos become N INDEPENDENT Luma image-to-video calls, one per
+    outfit's own photo. ray-3.2's Agents API cannot extend a prior generation
+    (`start_frame.generation_id`) and introduce a new reference image in the
+    same call, so segments are never chained — chaining a generation_id
+    forward just re-animates the same outfit with no new visual input, which
+    is why outfits after the first previously never showed up in the output.
+    Segments are downloaded and concatenated with a short crossfade to soften
+    the hard cut between independently-generated shots, with uploaded music
+    muxed in afterward — Luma clips have no audio of their own.
+
+    `background_url` is accepted (and the upload is still validated) but is
+    not currently fed into generation: pairing it with the outfit photo as a
+    second keyframe previously caused Luma to morph the room into the person
+    instead of animating the outfit. Consistency across segments relies on
+    `prompt` alone; see the review notes on true background-lock as a
+    follow-up if segments visibly disagree on the room."""
     client = client or LumaClient(settings.luma_api_key)
-    frame0 = ("image", background_url)
     segment_paths: list[Path] = []
 
     try:
@@ -118,8 +129,7 @@ def run_generation_chain(
             _update_job(job_id, step=index)
             payload = build_generation_payload(
                 prompt=prompt,
-                frame0=frame0,
-                frame1=("image", outfit_url),
+                image_url=outfit_url,
                 aspect_ratio=aspect_ratio,
                 duration_seconds=duration_seconds,
             )
@@ -144,7 +154,6 @@ def run_generation_chain(
                 return
 
             segment_paths.append(_download_video(OUTPUT_DIR / f"{job_id}-segment-{index}.mp4", generation["video_url"]))
-            frame0 = ("generation", created["provider_id"])
 
         final_path = _assemble_final_video(job_id, segment_paths, music_path, audio)
         _update_job(
@@ -192,23 +201,67 @@ def _has_audio_stream(ffmpeg_exe: str, path: Path) -> bool:
     return "Audio:" in result.stderr
 
 
+# Explicit encode settings for every path that re-encodes video below. The
+# previous code fell back to ffmpeg's bare defaults on re-encode, which for
+# this ffmpeg build means a low-effort preset — a real, measurable quality
+# loss on top of whatever Luma already delivered. -crf 16 is visually
+# near-lossless (0 is lossless, 23 is libx264's default); -preset slow trades
+# encode time for compression efficiency at that quality.
+_HQ_ENCODE_ARGS = ["-c:v", "libx264", "-crf", "16", "-preset", "slow", "-pix_fmt", "yuv420p"]
+
+# Crossfade length for the dissolve between independently-generated outfit
+# segments (see build_generation_payload's docstring for why segments can't
+# be continuous at the API level). A hard cut is the most jarring version of
+# an unavoidable discontinuity; a short dissolve reads as an intentional
+# transition instead of a stitching bug.
+_CROSSFADE_SECONDS = 0.5
+
+
+def _probe_duration_seconds(ffmpeg_exe: str, path: Path) -> float:
+    result = subprocess.run([ffmpeg_exe, "-i", str(path)], capture_output=True, text=True)
+    match = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", result.stderr)
+    if not match:
+        raise ValueError(f"could not read duration from ffmpeg output for {path}")
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
 def _concatenate_segments(ffmpeg_exe: str, segment_paths: list[Path], destination: Path) -> None:
     if len(segment_paths) == 1:
         destination.write_bytes(segment_paths[0].read_bytes())
         return
 
-    list_file = destination.with_suffix(".txt")
-    list_file.write_text("\n".join(f"file '{p.resolve().as_posix()}'" for p in segment_paths), encoding="utf-8")
-    try:
+    # xfade requires knowing each clip's duration up front to place the next
+    # crossfade's offset, and it re-encodes regardless (it's a per-frame
+    # blend, not a container-level splice) — so this always uses _HQ_ENCODE_ARGS
+    # rather than trying stream copy first.
+    durations = [_probe_duration_seconds(ffmpeg_exe, p) for p in segment_paths[:-1]]
+    fade = min(_CROSSFADE_SECONDS, min(durations) / 2) if durations else 0
+    args = [ffmpeg_exe, "-y"]
+    for path in segment_paths:
+        args += ["-i", str(path)]
+
+    if fade <= 0:
+        # A segment shorter than 2x the crossfade would produce a negative or
+        # zero offset; fall back to a hard-cut concat rather than fail the job.
+        list_file = destination.with_suffix(".txt")
+        list_file.write_text("\n".join(f"file '{p.resolve().as_posix()}'" for p in segment_paths), encoding="utf-8")
         try:
-            _run_ffmpeg([ffmpeg_exe, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(destination)])
-        except subprocess.CalledProcessError:
-            # Stream-copy concat requires byte-identical codec parameters across
-            # segments; that can vary slightly between separate Luma calls, so
-            # fall back to a re-encode, which tolerates that mismatch.
-            _run_ffmpeg([ffmpeg_exe, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), str(destination)])
-    finally:
-        list_file.unlink(missing_ok=True)
+            _run_ffmpeg([ffmpeg_exe, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), *_HQ_ENCODE_ARGS, str(destination)])
+        finally:
+            list_file.unlink(missing_ok=True)
+        return
+
+    filter_chain = []
+    running_offset = 0.0
+    last_label = "0:v"
+    for index, duration in enumerate(durations):
+        running_offset += duration - fade
+        next_label = f"v{index}"
+        filter_chain.append(f"[{last_label}][{index + 1}:v]xfade=transition=fade:duration={fade}:offset={running_offset}[{next_label}]")
+        last_label = next_label
+    args += ["-filter_complex", ";".join(filter_chain), "-map", f"[{last_label}]", *_HQ_ENCODE_ARGS, str(destination)]
+    _run_ffmpeg(args)
 
 
 def _mux_audio(ffmpeg_exe: str, video_path: Path, music_path: Path | None, audio: AudioSettings, destination: Path) -> None:
@@ -260,7 +313,7 @@ def _assemble_final_video(job_id: str, segment_paths: list[Path], music_path: Pa
     return final_path
 
 
-@app.post("/api/assets", status_code=status.HTTP_201_CREATED)
+@app.post("/api/assets", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_api_key)])
 async def upload_asset(
     kind: str = Form(...),
     file: UploadFile = File(...),

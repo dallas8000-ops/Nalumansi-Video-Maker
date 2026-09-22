@@ -3,60 +3,59 @@ import httpx
 from app.luma import LumaClient, build_generation_payload
 
 
-def test_generation_payload_nests_video_fields_and_uses_ray_3_2():
+def test_generation_payload_uses_ray_3_2_and_pins_the_outfit_photo_as_start_frame():
     payload = build_generation_payload(
         prompt="showcase the outfit",
-        frame0=("image", "https://example.test/background"),
-        frame1=("image", "https://example.test/outfit-1"),
+        image_url="https://example.test/outfit-1",
         aspect_ratio="9:16",
-        duration_seconds=10,
+        duration_seconds=5,
     )
 
     assert payload["model"] == "ray-3.2"
     assert payload["type"] == "video"
     assert payload["aspect_ratio"] == "9:16"
     assert payload["prompt"] == "showcase the outfit"
-    # Pin only the outfit. Using background as start and outfit as end morphs
-    # the empty room into the person, which changes the background mid-clip.
     assert payload["video"] == {
-        "resolution": "720p",
+        "resolution": "1080p",
+        "duration": "5s",
+        "start_frame": {"url": "https://example.test/outfit-1"},
+    }
+
+
+def test_generation_payload_at_10s_uses_a_single_keyframe_not_start_frame():
+    # ray-3.2 rejects start_frame/end_frame at duration=10s; only multi-keyframe
+    # mode is valid there. This is what previously produced Luma's 400s at 10s
+    # (fixed for real by switching format, not just shortening duration).
+    payload = build_generation_payload(
+        prompt="showcase the outfit",
+        image_url="https://example.test/outfit-1",
+        aspect_ratio="9:16",
+        duration_seconds=10,
+    )
+
+    assert payload["video"] == {
+        "resolution": "1080p",
         "duration": "10s",
         "keyframes": [{"url": "https://example.test/outfit-1"}],
         "keyframe_indexes": [0],
     }
 
 
-def test_generation_payload_pins_5s_shot_to_the_outfit_start_frame_only():
+def test_generation_payload_never_chains_via_generation_id():
+    # Regression guard for the actual bug: build_generation_payload must never
+    # accept or emit a generation_id anchor, because ray-3.2's Agents API
+    # can't combine that with a new reference image in one call — any chaining
+    # attempt silently drops the new outfit's photo. Every call must be a
+    # fresh image-to-video request from that outfit's own photo.
+    import inspect
+
+    signature = inspect.signature(build_generation_payload)
+    assert "frame0" not in signature.parameters
+    assert "frame1" not in signature.parameters
     payload = build_generation_payload(
-        prompt="showcase the outfit",
-        frame0=("image", "https://example.test/background"),
-        frame1=("image", "https://example.test/outfit-1"),
-        aspect_ratio="9:16",
-        duration_seconds=5,
+        prompt="p", image_url="https://example.test/x", aspect_ratio="9:16", duration_seconds=5
     )
-
-    assert payload["video"] == {
-        "resolution": "720p",
-        "duration": "5s",
-        "start_frame": {"url": "https://example.test/outfit-1"},
-    }
-
-
-def test_generation_payload_supports_chaining_from_a_prior_generation():
-    payload = build_generation_payload(
-        prompt="continue the showcase",
-        frame0=("generation", "gen-1"),
-        frame1=("image", "https://example.test/outfit-2"),
-        aspect_ratio="9:16",
-        duration_seconds=10,
-    )
-
-    # Extend only accepts a single generation_id start_frame, and not with 10s.
-    assert payload["video"] == {
-        "resolution": "720p",
-        "duration": "5s",
-        "start_frame": {"generation_id": "gen-1"},
-    }
+    assert "generation_id" not in str(payload)
 
 
 def test_luma_client_posts_to_agents_generations_endpoint_and_reads_state():
@@ -130,26 +129,6 @@ def test_luma_client_get_generation_reads_completed_video_url_from_output_list()
     assert result["video_url"] == "https://cdn.test/presigned-clip.mp4"
 
 
-def test_luma_client_includes_luma_error_body_on_http_failure():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            400,
-            json={"detail": "duration 10s is not supported with start_frame or end_frame"},
-        )
-
-    client = LumaClient(
-        api_key="test-key",
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-
-    try:
-        client.create_generation({"model": "ray-3.2", "type": "video", "prompt": "test"})
-        assert False, "expected ValueError"
-    except ValueError as error:
-        assert "400" in str(error)
-        assert "duration 10s" in str(error)
-
-
 def test_luma_client_raises_when_response_has_no_id():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(201, json={"state": "queued", "output": []})
@@ -164,3 +143,24 @@ def test_luma_client_raises_when_response_has_no_id():
         assert False, "expected ValueError"
     except ValueError:
         pass
+
+
+def test_luma_client_raises_with_response_body_on_http_error():
+    # _raise_for_luma_status exists specifically so a 400/401/403 carries
+    # Luma's actual error detail into the job's failure_reason instead of a
+    # generic httpx status error — this is what earlier let a wrong-model 403
+    # get diagnosed at all.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text='{"detail":"video.duration: invalid"}')
+
+    client = LumaClient(
+        api_key="test-key",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    try:
+        client.create_generation({"model": "ray-3.2", "type": "video", "prompt": "test"})
+        assert False, "expected ValueError"
+    except ValueError as error:
+        assert "400" in str(error)
+        assert "invalid" in str(error)

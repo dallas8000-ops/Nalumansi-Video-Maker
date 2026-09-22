@@ -163,7 +163,11 @@ def test_generation_endpoint_rejects_missing_music_asset(monkeypatch, tmp_path):
 # --- video assembly (real ffmpeg, synthetic fixtures, no network) ---
 
 
-def test_concatenate_segments_sums_durations(tmp_path):
+def test_concatenate_segments_crossfades_and_shortens_by_the_overlap(tmp_path):
+    # Two 0.5s clips crossfaded over min(_CROSSFADE_SECONDS, 0.5/2) = 0.25s of
+    # overlap should produce ~0.75s of output, not 1.0s of hard-cut concat —
+    # this pins down that the dissolve actually overlaps frames rather than
+    # just being appended as a third clip.
     clip_a = _make_clip(tmp_path / "a.mp4", seconds=0.5)
     clip_b = _make_clip(tmp_path / "b.mp4", seconds=0.5)
     destination = tmp_path / "out.mp4"
@@ -171,8 +175,35 @@ def test_concatenate_segments_sums_durations(tmp_path):
     main_module._concatenate_segments(FFMPEG, [clip_a, clip_b], destination)
 
     assert destination.is_file()
-    probe = subprocess.run([FFMPEG, "-i", str(destination)], capture_output=True, text=True)
-    assert "Duration: 00:00:00.9" in probe.stderr or "Duration: 00:00:01.0" in probe.stderr
+    duration = main_module._probe_duration_seconds(FFMPEG, destination)
+    assert 0.65 <= duration <= 0.85, duration
+
+
+def test_concatenate_segments_hard_cuts_when_crossfade_is_disabled(tmp_path, monkeypatch):
+    # fade = min(_CROSSFADE_SECONDS, shortest_clip / 2) guards against a
+    # negative xfade offset for any positive _CROSSFADE_SECONDS. The one way
+    # to hit fade <= 0 is _CROSSFADE_SECONDS itself being 0 (crossfade
+    # disabled) — this pins down that path falls back to a plain concat
+    # instead of dividing by zero or emitting a degenerate xfade call.
+    monkeypatch.setattr(main_module, "_CROSSFADE_SECONDS", 0)
+    clip_a = _make_clip(tmp_path / "a.mp4", seconds=0.3)
+    clip_b = _make_clip(tmp_path / "b.mp4", seconds=0.3)
+    destination = tmp_path / "out.mp4"
+
+    main_module._concatenate_segments(FFMPEG, [clip_a, clip_b], destination)
+
+    assert destination.is_file()
+    duration = main_module._probe_duration_seconds(FFMPEG, destination)
+    assert 0.5 <= duration <= 0.7, duration
+
+
+def test_concatenate_segments_single_clip_is_passed_through_unchanged(tmp_path):
+    clip_a = _make_clip(tmp_path / "a.mp4", seconds=0.4)
+    destination = tmp_path / "out.mp4"
+
+    main_module._concatenate_segments(FFMPEG, [clip_a], destination)
+
+    assert destination.read_bytes() == clip_a.read_bytes()
 
 
 def test_mux_audio_with_muted_original_uses_only_music_track(tmp_path):

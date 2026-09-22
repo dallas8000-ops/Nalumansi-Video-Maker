@@ -1,11 +1,6 @@
-from typing import Any, Literal
+from typing import Any
 
 import httpx
-
-# A keyframe is either a fresh image ("image", url) or a continuation of a
-# previously *completed* generation ("generation", generation_id) — Luma's
-# "extend" mechanic. See build_generation_payload().
-KeyframeSource = tuple[Literal["image", "generation"], str]
 
 TERMINAL_STATES = {"completed", "failed"}
 
@@ -55,54 +50,46 @@ def _serialize(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _keyframe(source: KeyframeSource) -> dict[str, Any]:
-    kind, value = source
-    if kind == "image":
-        return {"url": value}
-    if kind == "generation":
-        return {"generation_id": value}
-    raise ValueError(f"unknown keyframe source kind: {kind!r}")
-
-
 def build_generation_payload(
     *,
     prompt: str,
-    frame0: KeyframeSource,
-    frame1: KeyframeSource,
+    image_url: str,
     aspect_ratio: str,
     duration_seconds: int,
-    resolution: str = "720p",
+    resolution: str = "1080p",
 ) -> dict[str, Any]:
-    """Build a ray-3.2 Agents API video request.
+    """Build a ray-3.2 Agents API image-to-video request for one outfit.
 
-    Image-to-video pins only the outfit as the first frame. Pairing an empty
-    showroom as start and the outfit photo as end makes Luma morph one picture
-    into the other, which changes the background and produces ugly motion.
+    Every outfit is an INDEPENDENT generation from that outfit's own photo —
+    never a continuation of the previous outfit's clip. This is not a
+    stylistic choice, it's forced by the API: ray-3.2's Agents API "extension
+    flows accept only a single generation_id anchor ... not alongside
+    additional image references" (docs.agents.lumalabs.ai/guides/videos/
+    generation). You cannot pass a prior generation_id as start_frame AND a
+    new image as end_frame/keyframe in the same call.
 
-    5s uses start_frame. 10s cannot use start_frame, so it uses a single
-    keyframe at index 0.
-
-    Forward-extend from a completed clip can only send a single
-    `start_frame.generation_id`, and not with 10s, so extend steps are 5s.
+    The previous version of this function got this wrong: for outfit 2+ it
+    built a payload with ONLY `start_frame: {generation_id: <previous>}` and
+    silently dropped the new outfit's photo, because the caller passed it as
+    `frame1` and this function never read `frame1` on the extend branch. The
+    practical effect was that outfits after the first never appeared in the
+    generated video at all — the "chain" was just Luma extending outfit #1's
+    clip with no new visual reference, N times.
     """
-    if frame0[0] == "generation":
+    if duration_seconds == 10:
+        # end_frame/start_frame pairs cap out at 5s; only multi-keyframe mode
+        # is valid at 10s, so a single still becomes a one-keyframe request.
         video: dict[str, Any] = {
             "resolution": resolution,
-            "duration": "5s",
-            "start_frame": {"generation_id": frame0[1]},
-        }
-    elif duration_seconds == 10:
-        video = {
-            "resolution": resolution,
             "duration": "10s",
-            "keyframes": [_keyframe(frame1)],
+            "keyframes": [{"url": image_url}],
             "keyframe_indexes": [0],
         }
     else:
         video = {
             "resolution": resolution,
             "duration": f"{duration_seconds}s",
-            "start_frame": _keyframe(frame1),
+            "start_frame": {"url": image_url},
         }
     return {
         "model": "ray-3.2",
