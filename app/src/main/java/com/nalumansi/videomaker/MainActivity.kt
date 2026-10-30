@@ -283,6 +283,7 @@ private fun NalumansiApp() {
                                         withContext(Dispatchers.IO) { client.downloadVideo(videoUrl, destination) }
                                         resultVideoPath = destination.absolutePath
                                         screen = AppScreen.RESULT
+                                        playSavedVideo(context, destination)
                                         return@LaunchedEffect
                                     }
                                     "failed" -> {
@@ -305,6 +306,7 @@ private fun NalumansiApp() {
             AppScreen.RESULT -> ResultScreen(
                 modifier = Modifier.padding(padding),
                 videoPath = resultVideoPath,
+                onPlay = { resultVideoPath?.let { playSavedVideo(context, File(it)) } },
                 onShare = {
                     resultVideoPath?.let { path ->
                         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(path))
@@ -534,7 +536,13 @@ private fun ProcessingScreen(modifier: Modifier, step: Int, totalSteps: Int) {
 }
 
 @Composable
-private fun ResultScreen(modifier: Modifier, videoPath: String?, onShare: () -> Unit, onNewVideo: () -> Unit) {
+private fun ResultScreen(
+    modifier: Modifier,
+    videoPath: String?,
+    onPlay: () -> Unit,
+    onShare: () -> Unit,
+    onNewVideo: () -> Unit,
+) {
     Column(modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         Text("4. Your video is ready", style = MaterialTheme.typography.headlineSmall)
         Surface(tonalElevation = 2.dp, modifier = Modifier.fillMaxWidth().height(160.dp)) {
@@ -548,10 +556,20 @@ private fun ResultScreen(modifier: Modifier, videoPath: String?, onShare: () -> 
             }
         }
         if (videoPath != null) {
+            Button(onClick = onPlay, modifier = Modifier.fillMaxWidth()) { Text("Play video") }
             Button(onClick = onShare, modifier = Modifier.fillMaxWidth()) { Text("Share video") }
         }
         OutlinedButton(onClick = onNewVideo, modifier = Modifier.fillMaxWidth()) { Text("Create another video") }
     }
+}
+
+private fun playSavedVideo(context: android.content.Context, file: File) {
+    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, "video/mp4")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(intent, "Play video"))
 }
 
 @Composable
